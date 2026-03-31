@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Обсервация — 2D мини-игра</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111827;
+      --panel: #1f2937;
+      --accent: #22c55e;
+      --danger: #ef4444;
+      --warn: #f59e0b;
+      --muted: #9ca3af;
+    }
+    body {
+      margin: 0;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: var(--bg);
+      color: #e5e7eb;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      min-height: 100vh;
+    }
+    .hud {
+      background: #0b1220;
+      border-right: 1px solid #253246;
+      padding: 16px;
+      box-sizing: border-box;
+      overflow: auto;
+    }
+    .hud h1 {
+      margin: 0 0 10px;
+      font-size: 18px;
+    }
+    .stat {
+      padding: 8px 10px;
+      background: #111a2b;
+      border: 1px solid #253246;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      font-size: 14px;
+    }
+    .legend {
+      margin-top: 12px;
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+    .legend strong { color: #e5e7eb; }
+
+    .game-wrap {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    canvas {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      max-width: 100%;
+      height: auto;
+    }
+    .btn {
+      width: 100%;
+      margin-top: 10px;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 10px;
+      background: #182235;
+      color: #e5e7eb;
+      cursor: pointer;
+    }
+    .btn:hover { border-color: #4b5563; }
+  </style>
+</head>
+<body>
+  <aside class="hud">
+    <h1>Обсервационное отделение</h1>
+    <div class="stat" id="time">Время: 0 c</div>
+    <div class="stat" id="lost-total">Потеряно пациентов: 0</div>
+    <div class="stat" id="lost-escape">Сбежали (агрессия): 0</div>
+    <div class="stat" id="lost-starve">Умерли от истощения: 0</div>
+    <div class="stat" id="lost-thirst">Умерли от обезвоживания: 0</div>
+    <div class="stat" id="lost-bladder">Погибли из-за пузыря: 0</div>
+    <button class="btn" id="restart">Перезапустить игру</button>
+    <div class="legend">
+      <strong>Управление:</strong><br>
+      • Стрелки — движение врача<br>
+      • Пробел — помочь пациенту у двери (если есть нужный предмет)<br><br>
+      <strong>Предметы в коридоре:</strong><br>
+      💉 шприц — для агрессивных<br>
+      🍲 еда — для отказывающихся от еды<br>
+      💧 вода — для жаждущих<br>
+      🔑 ключ — открыть туалет
+    </div>
+  </aside>
+
+  <main class="game-wrap">
+    <canvas id="game" width="960" height="640"></canvas>
+  </main>
+
+  <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    const hud = {
+      time: document.getElementById('time'),
+      total: document.getElementById('lost-total'),
+      escape: document.getElementById('lost-escape'),
+      starve: document.getElementById('lost-starve'),
+      thirst: document.getElementById('lost-thirst'),
+      bladder: document.getElementById('lost-bladder')
+    };
+
+    const W = canvas.width;
+    const H = canvas.height;
+    const corridorX = 330;
+    const corridorW = 300;
+    const boxW = 290;
+    const boxH = 92;
+    const sidePad = 26;
+    const rows = 6;
+    const keys = new Set();
+
+    const STATE = {
+      calm: { name: 'спокоен', color: '#64748b' },
+      aggr: { name: 'агрессия', color: '#ef4444', needed: 'syringe', fail: 'escape', ttl: 16 },
+      hunger: { name: 'голодовка', color: '#f59e0b', needed: 'food', fail: 'starve', ttl: 20 },
+      thirst: { name: 'жажда', color: '#06b6d4', needed: 'water', fail: 'thirst', ttl: 18 },
+      toilet: { name: 'хочет в туалет', color: '#a78bfa', needed: 'key', fail: 'bladder', ttl: 15 }
+    };
+
+    const ITEM = {
+      syringe: { emoji: '💉', color: '#fecaca' },
+      food: { emoji: '🍲', color: '#fde68a' },
+      water: { emoji: '💧', color: '#bfdbfe' },
+      key: { emoji: '🔑', color: '#ddd6fe' }
+    };
+
+    let game;
+
+    function resetGame() {
+      const patients = [];
+      for (let i = 0; i < rows; i++) {
+        patients.push(makePatient(i, 'left'));
+        patients.push(makePatient(i, 'right'));
+      }
+
+      game = {
+        start: performance.now(),
+        last: performance.now(),
+        doctor: {
+          x: corridorX + corridorW / 2,
+          y: H / 2,
+          speed: 190,
+          inventory: null
+        },
+        patients,
+        items: [],
+        nextStateIn: 2,
+        nextItemIn: 1,
+        loss: { escape: 0, starve: 0, thirst: 0, bladder: 0 }
+      };
+    }
+
+    function makePatient(row, side) {
+      const y = sidePad + row * (boxH + 8);
+      const x = side === 'left' ? 26 : corridorX + corridorW + 14;
+      const doorX = side === 'left' ? corridorX - 5 : corridorX + corridorW - 5;
+
+      return {
+        row,
+        side,
+        x,
+        y,
+        w: boxW,
+        h: boxH,
+        doorX,
+        doorY: y + h / 2,
+        alive: true,
+        escaped: false,
+        state: 'calm',
+        urgency: 0,
+        timer: 0
+      };
+    }
+
+    function rand(a, b) {
+      return Math.random() * (b - a) + a;
+    }
+
+    function pick(arr) {
+      return arr[(Math.random() * arr.length) | 0];
+    }
+
+    function activateRandomPatient() {
+      const calm = game.patients.filter(p => p.alive && !p.escaped && p.state === 'calm');
+      if (!calm.length) return;
+      const p = pick(calm);
+      const stateKey = pick(['aggr', 'hunger', 'thirst', 'toilet']);
+      p.state = stateKey;
+      p.urgency = 0;
+      p.timer = STATE[stateKey].ttl;
+    }
+
+    function spawnItem() {
+      const kind = pick(['syringe', 'food', 'water', 'key']);
+      const item = {
+        kind,
+        x: rand(corridorX + 20, corridorX + corridorW - 20),
+        y: rand(24, H - 24),
+        r: 14
+      };
+      game.items.push(item);
+      if (game.items.length > 8) game.items.shift();
+    }
+
+    function update(dt) {
+      const d = game.doctor;
+      let dx = 0;
+      let dy = 0;
+      if (keys.has('ArrowLeft')) dx -= 1;
+      if (keys.has('ArrowRight')) dx += 1;
+      if (keys.has('ArrowUp')) dy -= 1;
+      if (keys.has('ArrowDown')) dy += 1;
+      const len = Math.hypot(dx, dy) || 1;
+
+      d.x += (dx / len) * d.speed * dt;
+      d.y += (dy / len) * d.speed * dt;
+
+      d.x = Math.max(corridorX + 10, Math.min(corridorX + corridorW - 10, d.x));
+      d.y = Math.max(10, Math.min(H - 10, d.y));
+
+      for (let i = game.items.length - 1; i >= 0; i--) {
+        const it = game.items[i];
+        if (Math.hypot(d.x - it.x, d.y - it.y) < it.r + 12) {
+          d.inventory = it.kind;
+          game.items.splice(i, 1);
+        }
+      }
+
+      game.nextStateIn -= dt;
+      if (game.nextStateIn <= 0) {
+        activateRandomPatient();
+        game.nextStateIn = rand(2.2, 4.2);
+      }
+
+      game.nextItemIn -= dt;
+      if (game.nextItemIn <= 0) {
+        spawnItem();
+        game.nextItemIn = rand(1.8, 3.3);
+      }
+
+      for (const p of game.patients) {
+        if (!p.alive || p.escaped || p.state === 'calm') continue;
+        p.timer -= dt;
+        p.urgency = 1 - p.timer / STATE[p.state].ttl;
+        if (p.timer <= 0) {
+          p.alive = false;
+          const fail = STATE[p.state].fail;
+          if (fail === 'escape') p.escaped = true;
+          game.loss[fail] += 1;
+          p.state = 'calm';
+        }
+      }
+
+      updateHud();
+    }
+
+    function tryHelpNearestPatient() {
+      const d = game.doctor;
+      const near = game.patients
+        .filter(p => p.alive && !p.escaped && p.state !== 'calm')
+        .filter(p => Math.abs(p.doorY - d.y) < 42 && Math.abs((corridorX + corridorW / 2) - d.x) < 170)
+        .sort((a, b) => Math.abs(a.doorY - d.y) - Math.abs(b.doorY - d.y));
+
+      if (!near.length) return;
+      const p = near[0];
+      const need = STATE[p.state].needed;
+      if (d.inventory === need) {
+        d.inventory = null;
+        p.state = 'calm';
+        p.urgency = 0;
+        p.timer = 0;
+      }
+    }
+
+    function updateHud() {
+      const t = Math.floor((performance.now() - game.start) / 1000);
+      const total = game.loss.escape + game.loss.starve + game.loss.thirst + game.loss.bladder;
+      hud.time.textContent = `Время: ${t} c`;
+      hud.total.textContent = `Потеряно пациентов: ${total}`;
+      hud.escape.textContent = `Сбежали (агрессия): ${game.loss.escape}`;
+      hud.starve.textContent = `Умерли от истощения: ${game.loss.starve}`;
+      hud.thirst.textContent = `Умерли от обезвоживания: ${game.loss.thirst}`;
+      hud.bladder.textContent = `Погибли из-за пузыря: ${game.loss.bladder}`;
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, W, H);
+
+      ctx.fillStyle = '#111827';
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.fillStyle = '#1f2937';
+      ctx.fillRect(corridorX, 0, corridorW, H);
+
+      for (const p of game.patients) {
+        const stateDef = STATE[p.state];
+        ctx.fillStyle = '#0b1220';
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+        ctx.strokeStyle = '#334155';
+        ctx.strokeRect(p.x, p.y, p.w, p.h);
+
+        ctx.fillStyle = stateDef.color;
+        ctx.fillRect(p.side === 'left' ? corridorX - 10 : corridorX + corridorW, p.y + p.h / 2 - 18, 10, 36);
+
+        ctx.fillStyle = '#e5e7eb';
+        ctx.font = '12px sans-serif';
+        const label = p.alive
+          ? (p.state === 'calm' ? 'спокойно' : stateDef.name)
+          : (p.escaped ? 'сбежал' : 'умер');
+        ctx.fillText(label, p.x + 8, p.y + 16);
+
+        if (p.alive && p.state !== 'calm') {
+          const bw = p.w - 16;
+          ctx.fillStyle = '#111827';
+          ctx.fillRect(p.x + 8, p.y + p.h - 14, bw, 6);
+          ctx.fillStyle = stateDef.color;
+          ctx.fillRect(p.x + 8, p.y + p.h - 14, bw * Math.max(0, p.urgency), 6);
+        }
+      }
+
+      for (const it of game.items) {
+        ctx.beginPath();
+        ctx.fillStyle = ITEM[it.kind].color;
+        ctx.arc(it.x, it.y, it.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.font = '15px sans-serif';
+        ctx.fillStyle = '#0f172a';
+        ctx.fillText(ITEM[it.kind].emoji, it.x - 7, it.y + 5);
+      }
+
+      const d = game.doctor;
+      ctx.fillStyle = '#22c55e';
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, 12, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#e5e7eb';
+      ctx.font = '14px sans-serif';
+      const inv = d.inventory ? ITEM[d.inventory].emoji + ' ' + d.inventory : 'пусто';
+      ctx.fillText(`Инвентарь: ${inv}`, corridorX + 8, 20);
+      ctx.fillStyle = '#9ca3af';
+      ctx.fillText('Подойдите к двери нужного бокса и нажмите ПРОБЕЛ', corridorX + 8, H - 12);
+    }
+
+    function loop(now) {
+      const dt = Math.min(0.033, (now - game.last) / 1000);
+      game.last = now;
+      update(dt);
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' '].includes(e.key)) e.preventDefault();
+      if (e.key === ' ') tryHelpNearestPatient();
+      keys.add(e.key);
+    });
+    window.addEventListener('keyup', (e) => keys.delete(e.key));
+
+    document.getElementById('restart').addEventListener('click', resetGame);
+
+    resetGame();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
